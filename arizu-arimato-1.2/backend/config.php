@@ -1,0 +1,140 @@
+<?php
+// Suppress deprecation warnings for PHP 8.2+
+error_reporting(E_ALL & ~E_DEPRECATED);
+
+// Database configuration - Auto-detect environment
+if (file_exists(__DIR__ . '/config_local.php')) {
+    require __DIR__ . '/config_local.php';
+} else {
+    define('DB_HOST', 'sql105.infinityfree.com');
+    define('DB_USER', 'if0_42865773');
+    define('DB_PASS', 'YIfvzeJH4d');
+    define('DB_NAME', 'if0_42865773_hotel_management_system');
+}
+
+// Application configuration
+define('APP_NAME', 'Hotel Management System');
+
+// Google OAuth Client ID - defined in config_local.php if present
+if (!defined('GOOGLE_CLIENT_ID')) {
+    define('GOOGLE_CLIENT_ID', '');
+}
+
+// Security: Session configuration - prevents session hijacking
+if (session_status() === PHP_SESSION_NONE) {
+    session_start(); // Security: Start session for login state
+}
+
+// Security: Database connection with error handling
+function getDB() {
+    static $conn = null;
+    if ($conn !== null) return $conn;
+    try {
+        $conn = new PDO("mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4", DB_USER, DB_PASS); // Security: Use PDO with charset
+        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION); // Security: Enable error exceptions
+        $conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+        return $conn;
+    } catch(PDOException $e) {
+        die("Database connection failed. Please run setup first: <a href='index.php?r=setup/index'>Install</a><br>Error: " . $e->getMessage());
+    }
+}
+
+// Check if system is installed
+function isInstalled() {
+    try {
+        $db = getDB();
+        $db->query("SELECT 1 FROM users LIMIT 1");
+        return true;
+    } catch (Exception $e) {
+        return false;
+    }
+}
+
+// Security: Check if user is logged in
+function isLoggedIn() {
+    return isset($_SESSION['user_id']); // Security: Verify session exists
+}
+
+// Security: Check user role for access control
+function hasRole($roles) {
+    if (!isLoggedIn()) return false; // Security: Must be logged in first
+    if (!is_array($roles)) $roles = [$roles];
+    return in_array($_SESSION['user_role'], $roles); // Security: Check if user role matches allowed roles
+}
+
+// Security: Redirect to login if not authenticated
+function requireLogin() {
+    if (!isLoggedIn()) {
+        header('Location: index.php?r=login/index'); // Security: Force login
+        exit();
+    }
+}
+
+// Security: Redirect if no permission (Role-Based Access Control)
+function requireRole($roles) {
+    requireLogin(); // Security: Must be logged in first
+    if (!hasRole($roles)) {
+        header('Location: index.php?r=dashboard/index'); // Security: Deny access, redirect to dashboard
+        exit();
+    }
+}
+
+// Generate reservation number
+function generateReservationNumber() {
+    return 'RES-' . date('Ymd') . '-' . rand(1000, 9999);
+}
+
+// Format currency
+function formatCurrency($amount) {
+    $settings = getSystemSettings();
+    $currency = $settings['currency'] ?? 'USD';
+    return $currency . ' ' . number_format($amount, 2);
+}
+
+// Compute stay billing breakdown for a check-in (nights x rate + extras + tax)
+function computeCheckinBill($db, $check_in_id, $tax_rate = 0) {
+    $stmt = $db->prepare("SELECT c.check_in_time, c.expected_check_out, rm.price_per_night
+                          FROM check_ins c JOIN rooms rm ON c.room_id=rm.id WHERE c.id=?");
+    $stmt->execute([$check_in_id]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$row) return null;
+
+    $checkin = date('Y-m-d', strtotime($row['check_in_time']));
+    $checkout = $row['expected_check_out'];
+    if (strtotime($checkout) < strtotime($checkin)) $checkout = $checkin;
+    $nights = max(1, (int)((strtotime(date('Y-m-d', strtotime($checkout))) - strtotime(date('Y-m-d', strtotime($checkin)))) / 86400));
+
+    $room_charge = round($nights * (float)$row['price_per_night'], 2);
+
+    $stmt = $db->prepare("SELECT COALESCE(SUM(amount),0) FROM extra_charges WHERE check_in_id=?");
+    $stmt->execute([$check_in_id]);
+    $extra = (float)$stmt->fetchColumn();
+
+    $subtotal = $room_charge + $extra;
+    $tax = round($subtotal * $tax_rate / 100, 2);
+    return [
+        'nights' => $nights,
+        'rate' => (float)$row['price_per_night'],
+        'room_charge' => $room_charge,
+        'extra' => $extra,
+        'tax' => $tax,
+        'total' => round($subtotal + $tax, 2)
+    ];
+}
+
+// Get system settings
+function getSystemSettings() {
+    static $settings = null;
+    if ($settings !== null) return $settings;
+    try {
+        $db = getDB();
+        $stmt = $db->query("SELECT setting_key, setting_value FROM system_settings");
+        $settings = [];
+        while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+            $settings[$row['setting_key']] = $row['setting_value'];
+        }
+    } catch (Exception $e) {
+        $settings = ['currency' => 'USD', 'hotel_name' => 'Hotel Management System'];
+    }
+    return $settings;
+}
